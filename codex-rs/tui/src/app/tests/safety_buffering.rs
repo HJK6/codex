@@ -987,3 +987,113 @@ async fn safety_retry_rejects_unsupported_permissions_before_interrupting() -> R
     )
     .await
 }
+
+#[tokio::test]
+async fn stale_faster_model_popup_accept_does_not_persist_thread_settings() -> Result<()> {
+    let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
+    app.config.model = Some("terra".to_string());
+    app.config.model_reasoning_effort = Some(ReasoningEffortConfig::XHigh);
+    let mut app_server = start_config_write_test_app_server(&app).await?;
+    let mut tui = crate::tui::test_support::make_test_tui()?;
+    let turn_id = "stale-safety-buffered-turn";
+
+    let started = app_server.start_thread(&app.config).await?;
+    let thread_id = started.session.thread_id;
+    app.replace_chat_widget_with_app_server_thread(
+        &mut tui,
+        started,
+        ThreadAttachPresentation::SessionLineage,
+        /*initial_user_message*/ None,
+    )
+    .await?;
+    while app_event_rx.try_recv().is_ok() {}
+
+    app.chat_widget.set_model("terra");
+    app.chat_widget
+        .set_reasoning_effort(Some(ReasoningEffortConfig::XHigh));
+    app.chat_widget
+        .set_collaboration_mask(CollaborationModeMask {
+            name: "Default".to_string(),
+            mode: Some(ModeKind::Default),
+            model: Some("terra".to_string()),
+            reasoning_effort: Some(Some(ReasoningEffortConfig::XHigh)),
+            developer_instructions: None,
+        });
+
+    submit_prompt(&mut app, RETRY_PROMPT);
+    let turn = next_user_turn_event(&mut app_event_rx);
+    app.chat_widget
+        .record_safety_buffering_turn(turn_id.to_string(), &turn);
+    app.chat_widget
+        .handle_server_notification(turn_started_notification(thread_id, turn_id), None);
+    app.chat_widget.handle_server_notification(
+        ServerNotification::ModelSafetyBufferingUpdated(ModelSafetyBufferingUpdatedNotification {
+            thread_id: thread_id.to_string(),
+            turn_id: turn_id.to_string(),
+            model: "terra".to_string(),
+            use_cases: Vec::new(),
+            reasons: Vec::new(),
+            show_buffering_ui: true,
+            faster_model: Some("luna".to_string()),
+        }),
+        None,
+    );
+    assert!(app.chat_widget.can_retry_safety_buffered_turn(turn_id));
+
+    app.chat_widget.handle_server_notification(
+        agent_message_delta_notification(thread_id, turn_id, "agent-message", "visible output"),
+        None,
+    );
+    assert!(!app.chat_widget.can_retry_safety_buffered_turn(turn_id));
+
+    app.chat_widget
+        .handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    let retry = loop {
+        match app_event_rx.try_recv() {
+            Ok(AppEvent::RetrySafetyBufferedTurn {
+                thread_id,
+                turn_id,
+                model,
+                turn,
+                prompt,
+            }) => {
+                break SafetyBufferedRetry {
+                    thread_id,
+                    turn_id,
+                    model,
+                    turn,
+                    prompt,
+                };
+            }
+            Ok(_) => continue,
+            Err(err) => panic!("expected stale safety-buffering retry event: {err}"),
+        }
+    };
+
+    Box::pin(app.retry_safety_buffered_turn(&mut tui, &mut app_server, retry)).await;
+
+    let setting_updates = std::iter::from_fn(|| app_event_rx.try_recv().ok())
+        .filter_map(|event| match event {
+            AppEvent::UpdateModel(model) => Some(format!("UpdateModel({model})")),
+            AppEvent::UpdateReasoningEffort(effort) => {
+                Some(format!("UpdateReasoningEffort({effort:?})"))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(setting_updates, Vec::<String>::new());
+    assert_eq!(
+        app.chat_widget.current_collaboration_mode(),
+        &CollaborationMode {
+            mode: ModeKind::Default,
+            settings: Settings {
+                model: "terra".to_string(),
+                reasoning_effort: Some(ReasoningEffortConfig::XHigh),
+                developer_instructions: None,
+            },
+        }
+    );
+
+    app_server.shutdown().await?;
+    Ok(())
+}
